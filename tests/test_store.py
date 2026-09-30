@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from seo_scorer import store as store_module
 from seo_scorer.events import EventType, SEOEvent
 from seo_scorer.store import (
     _LOCK_MODE,
@@ -367,3 +368,150 @@ class TestFilePermissions:
         SEOEventStore(tmp_path / "store")
 
         assert _mode(store.events_file) == 0o664
+
+
+class TestHistoryCompleteness:
+    """Reads report what they could not read, instead of skipping silently."""
+
+    def _filled(self, tmp_path, n=3):
+        store = SEOEventStore(tmp_path / "store")
+        for i in range(n):
+            store.append_event(_event(f"video_{i}", event_id=f"evt_{i}"))
+        return store
+
+    def test_a_clean_log_is_complete(self, tmp_path):
+        store = self._filled(tmp_path)
+
+        result = store.query_by_site_with_history(SITE)
+
+        assert [e.event_id for e in result.events] == ["evt_0", "evt_1", "evt_2"]
+        assert result.history.status == "complete"
+        assert result.history.is_complete
+        assert result.history.lines_read == 3
+        assert result.history.events_valid == 3
+        assert result.history.lines_invalid == 0
+
+    def test_an_empty_log_is_complete(self, store):
+        history = store.scan_history()
+
+        assert history.is_complete
+        assert history.lines_read == 0
+
+    def test_a_truncated_tail_is_a_partial_tail_not_damage(self, tmp_path):
+        store = self._filled(tmp_path)
+        with open(store.events_file, "a") as f:
+            f.write('{"event_id": "evt_torn", "event_ty')  # no newline
+
+        result = store.query_by_site_with_history(SITE, tail_recheck_delay=0)
+
+        assert len(result.events) == 3
+        assert result.history.status == "partial_tail"
+        assert not result.history.is_complete
+        assert result.history.partial_tail_line == 4
+        assert result.history.damaged_line_numbers == ()
+        assert result.history.lines_invalid == 1
+
+    def test_a_damaged_middle_line_is_damage(self, tmp_path):
+        store = self._filled(tmp_path)
+        lines = store.events_file.read_text().splitlines()
+        lines.insert(1, "NOT JSON{{{")
+        store.events_file.write_text("\n".join(lines) + "\n")
+
+        result = store.query_by_site_with_history(SITE)
+
+        assert len(result.events) == 3
+        assert result.history.status == "damaged"
+        assert not result.history.is_complete
+        assert result.history.damaged_line_numbers == (2,)
+        assert result.history.partial_tail_line is None
+
+    def test_a_newline_terminated_bad_last_line_is_damage(self, tmp_path):
+        store = self._filled(tmp_path)
+        with open(store.events_file, "a") as f:
+            f.write("NOT JSON{{{\n")
+
+        history = store.scan_history()
+
+        assert history.status == "damaged"
+        assert history.damaged_line_numbers == (4,)
+
+    def test_damage_wins_over_a_partial_tail(self, tmp_path):
+        store = self._filled(tmp_path)
+        lines = store.events_file.read_text().splitlines()
+        lines.insert(0, "NOT JSON{{{")
+        store.events_file.write_text("\n".join(lines) + "\n" + '{"event_id": "x')
+
+        history = store.scan_history(tail_recheck_delay=0)
+
+        assert history.status == "damaged"
+        assert history.damaged_line_numbers == (1,)
+        assert history.partial_tail_line == 5
+
+    def test_a_tail_that_completes_on_recheck_is_complete(self, tmp_path, monkeypatch):
+        store = self._filled(tmp_path, n=2)
+        pending = _event("video_2", event_id="evt_2").to_jsonl()
+        half = len(pending) // 2
+        with open(store.events_file, "a") as f:
+            f.write(pending[:half])
+
+        def finish_the_write(_seconds):
+            with open(store.events_file, "a") as f:
+                f.write(pending[half:] + "\n")
+
+        monkeypatch.setattr(store_module.time, "sleep", finish_the_write)
+
+        result = store.query_by_site_with_history(SITE, tail_recheck_delay=0.01)
+
+        assert [e.event_id for e in result.events] == ["evt_0", "evt_1", "evt_2"]
+        assert result.history.is_complete
+        assert result.history.lines_invalid == 0
+
+    def test_a_tail_that_stays_torn_is_reported_after_one_recheck(
+        self, tmp_path, monkeypatch
+    ):
+        store = self._filled(tmp_path, n=1)
+        with open(store.events_file, "a") as f:
+            f.write('{"event_id": "evt_torn"')
+        sleeps = []
+        monkeypatch.setattr(store_module.time, "sleep", sleeps.append)
+
+        history = store.scan_history(tail_recheck_delay=0.01)
+
+        assert history.status == "partial_tail"
+        assert sleeps == [0.01]
+
+    def test_the_default_methods_still_return_plain_lists(self, tmp_path):
+        store = self._filled(tmp_path)
+
+        assert isinstance(store.query_by_site(SITE), list)
+        assert isinstance(store.get_by_content_id(SITE, "video_0"), list)
+
+    def test_get_by_content_id_reports_history_too(self, tmp_path):
+        store = self._filled(tmp_path)
+        with open(store.events_file, "a") as f:
+            f.write("NOT JSON{{{\n")
+
+        result = store.get_by_content_id_with_history(SITE, "video_1")
+
+        assert [e.event_id for e in result.events] == ["evt_1"]
+        assert result.history.status == "damaged"
+        assert result.history.lines_read == 4
+
+    def test_a_limit_stop_is_not_complete(self, tmp_path):
+        store = self._filled(tmp_path)
+
+        result = store.query_by_site_with_history(SITE, limit=1)
+
+        assert len(result.events) == 1
+        assert not result.history.exhausted
+        assert not result.history.is_complete
+
+    def test_the_log_is_never_rewritten_by_a_read(self, tmp_path):
+        store = self._filled(tmp_path)
+        with open(store.events_file, "a") as f:
+            f.write('{"torn"')
+        before = store.events_file.read_bytes()
+
+        store.scan_history(tail_recheck_delay=0)
+
+        assert store.events_file.read_bytes() == before

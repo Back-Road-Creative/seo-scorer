@@ -216,6 +216,31 @@ Every line carries a CRC32 checksum, so a truncated or hand-edited line is
 detected on read rather than deserialising into wrong data. A bad line costs you
 that line and nothing else: queries log it and move on.
 
+Skipping a line is not silent to callers who ask. Each read has a
+`*_with_history` variant (and `scan_history()` for a whole-log check) that also
+returns a `HistoryCompleteness`: how many lines were read, how many were
+skipped as invalid, and a `status`:
+
+```python
+result = store.query_by_site_with_history("my_site")
+result.events  # the same list query_by_site returns
+result.history.status  # "complete", "partial_tail" or "damaged"
+result.history.is_complete  # True only for a full read of a clean log
+result.history.invalid_line_numbers
+```
+
+- `partial_tail` means the only bad line is the last one and has no trailing
+  newline, which is what a writer mid-append (or one that died mid-append) looks
+  like. Reads take no lock, so the read re-checks once after 50 ms before
+  reporting it. Treat it as "not known to be complete", not as lost data.
+- `damaged` means a bad line sits anywhere else, or ends in a newline. Those
+  events were lost to corruption that will not heal by itself.
+- A query stopped early by `limit` reports `exhausted=False` and is never
+  `is_complete`.
+
+Gate any report that says "full history" on `history.is_complete`. Reads never
+rewrite the log; the damaged lines stay on disk for you to repair.
+
 `events.jsonl` is the source of truth and `index.json` is only a cache, so
 deleting the index is safe — it is rebuilt by scanning the log on the next open.
 The same happens automatically if the index is unreadable.

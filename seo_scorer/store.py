@@ -19,6 +19,9 @@ deleting it is always safe.
 import contextlib
 import json
 import logging
+import time
+from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 
 try:
@@ -63,12 +66,87 @@ def group_writable_filelock(lock_path: Path) -> FileLock:
 _group_writable_filelock = group_writable_filelock
 
 
+#: How long a read waits before re-reading a log whose last line looks
+#: half-written. A writer appends one line at a time, so a torn tail is
+#: normally gone within milliseconds.
+TAIL_RECHECK_DELAY = 0.05
+
+_BAD_LINE_ERRORS = (ValueError, json.JSONDecodeError, KeyError)
+
+
+@dataclass(frozen=True)
+class HistoryCompleteness:
+    """What one read of the log could and could not use.
+
+    ``status`` is one of:
+
+    * ``"complete"`` -- every non-blank line was a valid event.
+    * ``"partial_tail"`` -- the only bad line is the last one and it has
+      no trailing newline: a writer is mid-append, or died mid-append.
+      The read re-checked once before reporting this. The log is
+      probably fine, but the history is not known to be complete.
+    * ``"damaged"`` -- at least one bad line is not a torn tail, so
+      events were lost to corruption that will not heal on its own.
+
+    Only ``"complete"`` with ``exhausted`` true is safe to label
+    complete; see :attr:`is_complete`.
+
+    Attributes:
+        lines_read: Non-blank lines examined.
+        events_valid: Lines that parsed into an event (before filters).
+        lines_invalid: Lines skipped because they did not parse or failed
+            their checksum.
+        invalid_line_numbers: 1-based line numbers of the skipped lines.
+        partial_tail_line: 1-based number of the torn last line, if any.
+        exhausted: False when a ``limit`` stopped the read early, so
+            lines after the stop were not examined.
+    """
+
+    lines_read: int = 0
+    events_valid: int = 0
+    lines_invalid: int = 0
+    invalid_line_numbers: tuple[int, ...] = ()
+    partial_tail_line: int | None = None
+    exhausted: bool = True
+
+    @property
+    def damaged_line_numbers(self) -> tuple[int, ...]:
+        """Skipped lines that are not the torn tail."""
+        return tuple(
+            n for n in self.invalid_line_numbers if n != self.partial_tail_line
+        )
+
+    @property
+    def status(self) -> str:
+        if self.damaged_line_numbers:
+            return "damaged"
+        if self.partial_tail_line is not None:
+            return "partial_tail"
+        return "complete"
+
+    @property
+    def is_complete(self) -> bool:
+        """True only if the whole log was read and every line was valid."""
+        return self.status == "complete" and self.exhausted
+
+
+@dataclass(frozen=True)
+class QueryResult:
+    """Events from a query, with the completeness of the read behind them."""
+
+    events: list[SEOEvent]
+    history: HistoryCompleteness
+
+
 class SEOEventStore:
     """Append-only event store, partitioned by site.
 
     Writes take an advisory file lock, so several processes can append
     to one store safely. Reads are lock-free and stream the log line by
-    line, so a corrupted line costs you that line and nothing else.
+    line, so a corrupted line costs you that line and nothing else. The
+    plain query methods return just the events; the ``*_with_history``
+    variants and :meth:`scan_history` also say how many lines were
+    skipped and whether the history is complete.
     """
 
     def __init__(self, storage_path: Path):
@@ -185,6 +263,10 @@ class SEOEventStore:
         comparison, which is correct for ISO 8601 timestamps in a single
         timezone; normalise to UTC before storing if you mix offsets.
 
+        Corrupted lines are skipped and logged. Use
+        :meth:`query_by_site_with_history` when you need to know whether
+        any were.
+
         Args:
             site_id: Site identifier (required).
             event_type: Keep only this event type.
@@ -195,34 +277,44 @@ class SEOEventStore:
         Returns:
             Matching events, in log order.
         """
-        events: list[SEOEvent] = []
+        return self.query_by_site_with_history(
+            site_id, event_type, start_date, end_date, limit
+        ).events
 
-        with open(self.events_file) as f:
-            for line in f:
-                try:
-                    event = SEOEvent.from_jsonl(line.strip())
+    def query_by_site_with_history(
+        self,
+        site_id: str,
+        event_type: EventType | None = None,
+        start_date: str | None = None,
+        end_date: str | None = None,
+        limit: int | None = None,
+        tail_recheck_delay: float = TAIL_RECHECK_DELAY,
+    ) -> QueryResult:
+        """Like :meth:`query_by_site`, plus a :class:`HistoryCompleteness`.
 
-                    if event.site_id != site_id:
-                        continue
+        Args:
+            site_id: Site identifier (required).
+            event_type: Keep only this event type.
+            start_date: Keep events at or after this ISO timestamp.
+            end_date: Keep events at or before this ISO timestamp.
+            limit: Stop after this many matches.
+            tail_recheck_delay: Seconds to wait before re-reading once if
+                the last line looks half-written.
 
-                    if event_type and event.event_type != event_type:
-                        continue
+        Returns:
+            The matching events and how complete the read was.
+        """
 
-                    if start_date and event.timestamp < start_date:
-                        continue
-                    if end_date and event.timestamp > end_date:
-                        continue
+        def keep(event: SEOEvent) -> bool:
+            if event.site_id != site_id:
+                return False
+            if event_type and event.event_type != event_type:
+                return False
+            if start_date and event.timestamp < start_date:
+                return False
+            return not (end_date and event.timestamp > end_date)
 
-                    events.append(event)
-
-                    if limit and len(events) >= limit:
-                        break
-
-                except (ValueError, json.JSONDecodeError, KeyError) as e:
-                    logger.warning("Skipping corrupted event line: %s", e)
-                    continue
-
-        return events
+        return self._read_log(keep, limit, tail_recheck_delay)
 
     def get_by_content_id(self, site_id: str, content_id: str) -> list[SEOEvent]:
         """Return every event recorded for one piece of content.
@@ -234,20 +326,94 @@ class SEOEventStore:
         Returns:
             The content's events, in log order.
         """
+        return self.get_by_content_id_with_history(site_id, content_id).events
+
+    def get_by_content_id_with_history(
+        self,
+        site_id: str,
+        content_id: str,
+        tail_recheck_delay: float = TAIL_RECHECK_DELAY,
+    ) -> QueryResult:
+        """Like :meth:`get_by_content_id`, plus a :class:`HistoryCompleteness`."""
+        return self._read_log(
+            lambda e: e.site_id == site_id and e.content_id == content_id,
+            None,
+            tail_recheck_delay,
+        )
+
+    def scan_history(
+        self, tail_recheck_delay: float = TAIL_RECHECK_DELAY
+    ) -> HistoryCompleteness:
+        """Read the whole log and report its completeness.
+
+        Never modifies the log. Use it before treating a set of events
+        as the full record of a site.
+        """
+        return self._read_log(lambda e: False, None, tail_recheck_delay).history
+
+    def _read_log(
+        self,
+        keep: Callable[[SEOEvent], bool],
+        limit: int | None,
+        tail_recheck_delay: float,
+    ) -> QueryResult:
+        """Stream the log, collecting events that pass ``keep``.
+
+        Reads take no lock, so a concurrent append can leave the last
+        line half-written. If the only trouble is such a tail, read once
+        more after ``tail_recheck_delay`` before reporting it.
+        """
+        result, reasons = self._read_log_once(keep, limit)
+        if result.history.partial_tail_line is not None:
+            time.sleep(tail_recheck_delay)
+            result, reasons = self._read_log_once(keep, limit)
+
+        for line_number, reason in reasons:
+            logger.warning("Skipping corrupted event line %d: %s", line_number, reason)
+        return result
+
+    def _read_log_once(
+        self, keep: Callable[[SEOEvent], bool], limit: int | None
+    ) -> tuple[QueryResult, list[tuple[int, Exception]]]:
         events: list[SEOEvent] = []
+        reasons: list[tuple[int, Exception]] = []
+        lines_read = 0
+        events_valid = 0
+        partial_tail_line: int | None = None
+        exhausted = True
 
         with open(self.events_file) as f:
-            for line in f:
+            for line_number, line in enumerate(f, start=1):
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                lines_read += 1
                 try:
-                    event = SEOEvent.from_jsonl(line.strip())
-
-                    if event.site_id == site_id and event.content_id == content_id:
-                        events.append(event)
-
-                except (ValueError, json.JSONDecodeError, KeyError):
+                    event = SEOEvent.from_jsonl(stripped)
+                except _BAD_LINE_ERRORS as e:
+                    reasons.append((line_number, e))
+                    # Only the last line can lack its newline, and a
+                    # writer that is still mid-append is the usual reason.
+                    if not line.endswith("\n"):
+                        partial_tail_line = line_number
                     continue
 
-        return events
+                events_valid += 1
+                if keep(event):
+                    events.append(event)
+                    if limit and len(events) >= limit:
+                        exhausted = False
+                        break
+
+        history = HistoryCompleteness(
+            lines_read=lines_read,
+            events_valid=events_valid,
+            lines_invalid=len(reasons),
+            invalid_line_numbers=tuple(n for n, _ in reasons),
+            partial_tail_line=partial_tail_line,
+            exhausted=exhausted,
+        )
+        return QueryResult(events, history), reasons
 
     # ---------------------------------------------------------------- #
     # Indexes
@@ -330,6 +496,9 @@ class SEOEventStore:
 
 __all__ = [
     "LOCK_MODE",
+    "TAIL_RECHECK_DELAY",
+    "HistoryCompleteness",
+    "QueryResult",
     "SEOEventStore",
     "group_writable_filelock",
 ]
